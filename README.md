@@ -56,6 +56,23 @@ Known limits: piano and guitar stems bleed into each other, sound effects and na
 
 Stems are reused if they already exist for a song; pass `--fresh` to redo the separation.
 
+## Sargam video
+
+```bash
+../.venv/bin/python visualize.py songs/my_song.mp3 --title "My song"
+```
+
+Makes `breakdowns/my_song/sargam.mp4`, a vertical 720×1280 video with the song's audio:
+
+- the voice's pitch drawn live on a Sa–Re–Ga–Ma ladder (with Western note names alongside)
+- the swaras in Devanagari and Latin, lighting up as they are sung, with komal, tivra and octave marks
+- repeat brackets (×3, ×4), a swara counter, peak speed and range
+- a lane per instrument: drum hits, bass with its current note, and the other parts, each labelled with what the breakdown identified, plus the current chord
+
+It also writes `sargam.txt` (the notation with timestamps) and `melody.json` (every note). The tonic is found automatically; force it with `--sa C`. Use `--start` and `--end` (seconds) to render part of a song, or `--no-video` for the notation only. A Devanagari font is needed (Noto Sans Devanagari, or the ones built into macOS and Windows).
+
+Checked against one clip with published notation: it found the same Sa and the same seven swaras, and counted 255 swaras where the reference shows 270. Very fast runs lose some notes, and lyric words are not detected.
+
 ## Test
 
 ```bash
