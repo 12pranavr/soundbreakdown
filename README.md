@@ -69,7 +69,7 @@ Makes `breakdowns/my_song/sargam.mp4`, a vertical 720×1280 video with the song'
 - repeat brackets (×3, ×4), a swara counter, peak speed and range
 - a lane per instrument: drum hits, bass with its current note, and the other parts, each labelled with what the breakdown identified, plus the current chord
 
-It also writes `sargam.txt` (the notation with timestamps) and `melody.json` (every note). The tonic is found automatically; force it with `--sa C`. Use `--start` and `--end` (seconds) to render part of a song, or `--no-video` for the notation only. A Devanagari font is needed (Noto Sans Devanagari, or the ones built into macOS and Windows).
+It also writes `sargam.txt` (the notation with timestamps) and `melody.json` (every note). The tonic is found automatically; force it with `--sa C`. If the track has no singing (an instrumental, or only narration), the melody line follows the lead instrument instead; choose which with `--lead guitar` (or `piano`, `other`, `bass`). Instrument melodies are less exact than a solo voice, and octave jumps from the pitch tracker are folded into two octaves. Use `--start` and `--end` (seconds) to render part of a song, or `--no-video` for the notation only. A Devanagari font is needed (Noto Sans Devanagari, or the ones built into macOS and Windows).
 
 Checked against one clip with published notation: it found the same Sa and the same seven swaras, and counted 255 swaras where the reference shows 270. Very fast runs lose some notes, and lyric words are not detected.
 

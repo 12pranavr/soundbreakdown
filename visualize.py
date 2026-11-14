@@ -322,7 +322,7 @@ def render(args, song, out, rep, stems_m, mel, total_dur):
         cw = c.width(chip, fs) + 20
         c.rect([40, 92, 40 + cw, 116], outline=mix(HOT, 0.5), r=4)
         c.text((50, 98), chip, fs, HOT)
-        c.text((W - 40, 98), "VOICE", fs, DIM, anchor="ra")
+        c.text((W - 40, 98), "VOICE" if args.lead == "vocals" else f"LEAD: {args.lead.upper()}", fs, DIM, anchor="ra")
 
         # ---- pitch ladder
         cur_semi = notes[cur]["semi"] if cur is not None else None
@@ -334,6 +334,8 @@ def render(args, song, out, rep, stems_m, mel, total_dur):
             is_sa = sv % 12 == 0
             c.line([(PX0, y), (PX1, y)], mix(VOICE, 0.55) if on else mix(TEXT, 0.22 if is_sa else 0.09), 1.4 if on else 1)
             col = VOICE if on else (mix(TEXT, 0.75) if sv in used else DIM)
+            if (PY1 - PY0) / (hi - lo) < 16 and not on and sv % 12 not in (0, 7):
+                continue                                   # crowded ladder: label only Sa, Pa and the live note
             c.swara(PX0 - 30, y - 13, sv, 17, col)
             note = NOTE_SHARP[(mel["sa_pc"] + sv) % 12]
             c.text((PX1 + 12, y - 7), f"{LAT[sv % 12]}", fs, col)
@@ -391,7 +393,7 @@ def render(args, song, out, rep, stems_m, mel, total_dur):
                     x += gap
 
         # ---- counter + progress
-        c.text((40, 858), f"SWARAS SUNG  {sung:03d} / {len(notes):03d}", fs, DIM)
+        c.text((40, 858), f"SWARAS {'SUNG' if args.lead == 'vocals' else 'PLAYED'}  {sung:03d} / {len(notes):03d}", fs, DIM)
         c.rect([250, 862, W - 40, 866], fill=GRID, r=2)
         c.rect([250, 862, 250 + (W - 290) * (now - t0) / max(1e-6, t1 - t0), 866], fill=VOICE, r=2)
 
@@ -457,6 +459,8 @@ def main():
     ap.add_argument("-o", "--out", default=None)
     ap.add_argument("--sa", default=None, help="force the tonic, e.g. C or F#")
     ap.add_argument("--title", default=None)
+    ap.add_argument("--lead", default=None, choices=["vocals", "guitar", "piano", "other", "bass"],
+                    help="which part to draw as the melody line (default: vocals, or the lead instrument if the voice is spoken)")
     ap.add_argument("--start", type=float, default=None)
     ap.add_argument("--end", type=float, default=None)
     ap.add_argument("--fps", type=int, default=30)
@@ -476,11 +480,20 @@ def main():
         stems_m[n] = librosa.resample(y.mean(1), orig_sr=sr, target_sr=ASR)
     total = len(stems_m["vocals"]) / ASR
 
-    print("[1/3] tracking the voice's pitch")
+    lead = args.lead
+    if not lead:
+        spoken = (rep.get("voice") or "").startswith("spoken")
+        sung = rep["stems"]["vocals"]["present"] and not spoken
+        melodic = [n for n in ("guitar", "other", "piano") if rep["stems"][n]["present"]]
+        lead = "vocals" if sung or not melodic else max(melodic, key=lambda n: rep["stems"][n]["level_vs_mix_db"])
+        if lead != "vocals":
+            print(f"      no singing in this track, so the melody line follows the {lead} part (change with --lead)")
+    args.lead = lead
+    print(f"[1/3] tracking the pitch of: {lead}")
     sys.stdout.flush()
-    t, midi, rms = track_pitch(stems_m["vocals"], 75, 1200)
+    t, midi, rms = track_pitch(stems_m[lead], 30 if lead == "bass" else 75, 300 if lead == "bass" else 1200)
     if np.isnan(midi).all():
-        sys.exit("No pitched voice found in this song.")
+        sys.exit("No clear pitch found in that part.")
     key_pc = NOTE_SHARP.index({"D♭": "C#", "E♭": "D#", "G♭": "F#", "A♭": "G#", "B♭": "A#"}.get(
         rep["key"].split()[0], rep["key"].split()[0]))
     sa_pc, off, hist = find_sa(midi, key_pc)
@@ -498,6 +511,33 @@ def main():
     print("[2/3] finding the notes")
     sys.stdout.flush()
     notes = segment_notes(t, midi, rms, sa_midi)
+    if notes:                                   # put the octave the melody lives in at the centre (no marks)
+        sv = np.array([n["semi"] for n in notes])
+        wt = np.array([n["end"] - n["start"] for n in notes])
+        o = np.argsort(sv)
+        med_semi = sv[o][np.searchsorted(np.cumsum(wt[o]) / wt.sum(), 0.5)]
+        shift = 12 * int(np.floor(med_semi / 12))
+        if shift:
+            sa_midi += shift
+            for n in notes:
+                n["semi"] -= shift
+            med_semi -= shift
+        # pitch trackers jump octaves on instruments; if the range is implausibly wide, fold it back
+        cum = np.cumsum(wt[o]) / wt.sum()
+        p_lo, p_hi = sv[o][np.searchsorted(cum, 0.015)], sv[o][min(len(sv) - 1, np.searchsorted(cum, 0.985))]
+        if p_hi - p_lo > 24:
+            fold_lo, fold_hi = med_semi - 9, med_semi + 14
+            print("      very wide pitch range found (likely octave errors); folding it into two octaves")
+            for n in notes:
+                while n["semi"] < fold_lo:
+                    n["semi"] += 12
+                while n["semi"] >= fold_hi:
+                    n["semi"] -= 12
+            midi = midi.copy()
+            relc = midi - sa_midi
+            relc = np.where(relc < fold_lo, relc + 12 * np.ceil((fold_lo - relc) / 12), relc)
+            relc = np.where(relc >= fold_hi, relc - 12 * np.ceil((relc - fold_hi + 0.01) / 12), relc)
+            midi = relc + sa_midi
     thaat, used = thaat_guess(notes)
     rel = midi - sa_midi
     disp = rel.copy()
@@ -525,7 +565,7 @@ def main():
         print("[3/3] rendering the video")
         sys.stdout.flush()
         mp4, stats = render(args, args.song, out, rep, stems_m, mel, total)
-    json.dump({"sa": NOTE_SHARP[sa_pc], "sa_auto_guess": NOTE_SHARP[sa_auto], "cents_from_a440": off * 100,
+    json.dump({"sa": NOTE_SHARP[sa_pc], "sa_auto_guess": NOTE_SHARP[sa_auto], "lead": lead, "cents_from_a440": off * 100,
                "thaat_guess": thaat, "swaras_used": [LAT[i] for i in used], "count": len(notes),
                "notes": [{**n, "swara": LAT[n["semi"] % 12], "octave": n["semi"] // 12,
                           "note": NOTE_SHARP[(sa_pc + n["semi"]) % 12]} for n in notes], **stats},
