@@ -3,8 +3,9 @@
 
 Usage:  python breakdown.py SONG_FILE [-o OUTPUT_DIR] [--no-stems]
 
-Free / open-source only: Demucs (htdemucs_6s) for stems, MIT AST (AudioSet) for
-instrument + genre + mood tags, librosa for tempo / key / beats / energy / timbre.
+Free / open-source only: Demucs (htdemucs_6s) for stems, LAION CLAP to identify
+instruments, genre and mood, MIT AST for voice and sound effects, librosa for
+tempo / key / tuning / chords / beats / energy / timbre.
 """
 import argparse
 import json
@@ -20,6 +21,8 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import numpy as np
 import soundfile as sf
 import librosa
+
+import sharp as S
 
 SR = 44100      # stem / stereo work
 ASR = 22050     # analysis rate
@@ -288,65 +291,6 @@ def energy_curve(mix_m):
     return t, norm
 
 
-def segment(mix_m, stems_m, beat_t, duration, tempo=None, forced=()):
-    chroma = librosa.feature.chroma_cqt(y=mix_m, sr=ASR, hop_length=HOP)
-    mfcc = librosa.feature.mfcc(y=mix_m, sr=ASR, hop_length=HOP, n_mfcc=13)
-    n = chroma.shape[1]
-    stem_rows = []
-    for k in STEM_ORDER:
-        r = librosa.feature.rms(y=stems_m[k], hop_length=HOP)[0][:n]
-        r = np.pad(r, (0, n - len(r)))
-        stem_rows.append(np.clip((db(r) + 60) / 60, 0, 1) * 2.0)
-    feat = np.vstack([chroma, librosa.util.normalize(mfcc, axis=1) * 0.5, np.array(stem_rows)])
-    times = librosa.frames_to_time(np.arange(n), sr=ASR, hop_length=HOP)
-    # unit = 1 bar when beats are known, else 2 seconds
-    if len(beat_t) > 16 and tempo:
-        bl = 4 * 60.0 / tempo
-        a = beat_t[0] % bl
-        bars = np.arange(a, duration, bl)
-        if a > 0.3:
-            bars = np.concatenate([[0.0], bars])
-    else:
-        bars = np.arange(0, duration, 2.0)
-    bf = librosa.time_to_frames(bars, sr=ASR, hop_length=HOP)
-    bf = bf[bf < n]
-    sync = librosa.util.sync(feat, bf, aggregate=np.mean)
-    k = int(np.clip(round(duration / 16), 3, 14))
-    k = min(k, sync.shape[1] - 1)
-    bounds = librosa.segment.agglomerative(sync, k)
-    edge_frames = np.concatenate([[0], bf])
-    bt = sorted(set([0.0] + [float(times[min(edge_frames[i], n - 1)]) for i in bounds] + [duration]))
-    unit = float(np.median(np.diff(bars))) if len(bars) > 2 else 2.0
-    # arrangement changes (instruments in/out, drops) are always section edges, snapped to a bar
-    for f in forced:
-        j = int(np.argmin(np.abs(bars - f)))
-        snap = float(bars[j]) if abs(bars[j] - f) < unit * 0.6 else float(f)
-        bt = [x for x in bt if abs(x - snap) >= max(6, 2 * unit) * 0.75 or x in (0.0, duration)]
-        bt.append(snap)
-    bt = sorted(set(bt))
-    merged = [bt[0]]
-    for x in bt[1:]:
-        if x - merged[-1] < max(6, 2 * unit) and x != duration:
-            continue
-        merged.append(x)
-    if len(merged) > 2 and merged[-1] - merged[-2] < max(6, 2 * unit):
-        merged.pop(-2)
-    vecs = []
-    for a, b in zip(merged[:-1], merged[1:]):
-        sel = (times >= a) & (times < b)
-        v = feat[:, sel].mean(1)
-        vecs.append(v / (np.linalg.norm(v) + 1e-9))
-    letters, protos = [], []
-    for v in vecs:
-        sims = [float(v @ p) for p in protos]
-        if sims and max(sims) > 0.97:
-            letters.append(chr(65 + int(np.argmax(sims))))
-        else:
-            protos.append(v)
-            letters.append(chr(65 + len(protos) - 1))
-    return list(zip(merged[:-1], merged[1:], letters))
-
-
 def measure_tuning(stems_m, stem_info):
     """Cents away from A4 = 440 Hz, from the strongest tonal peaks of the pitched stems."""
     per = {}
@@ -497,6 +441,7 @@ def describe_stem(name, stem, mix_rms):
         f0 = librosa.yin(m, fmin=fmin, fmax=fmax, sr=ASR, hop_length=HOP * 2)
         act2 = librosa.util.fix_length(active[::2], size=len(f0))
         f = f0[act2]
+        f = f[(f > fmin * 1.04) & (f < fmax * 0.96)]   # values stuck at the search limits are not real notes
         if len(f) > 20:
             lo, hi = np.percentile(f, 10), np.percentile(f, 90)
             info["pitch_range"] = f"{librosa.hz_to_note(lo)} – {librosa.hz_to_note(hi)}"
@@ -504,26 +449,6 @@ def describe_stem(name, stem, mix_rms):
             counts = np.bincount(midi, minlength=12)
             info["most_used_notes"] = [NOTE_NAMES[i] for i in np.argsort(counts)[::-1][:4]]
     return info, rms, active
-
-
-def entrances(stem_rms, duration, min_gap=4.0):
-    """Times where each stem comes in / drops out (after 1-second smoothing)."""
-    events = []
-    for name, rms in stem_rms.items():
-        w = max(1, int(ASR / HOP))
-        sm = np.convolve(rms, np.ones(w) / w, mode="same")
-        sdb = db(sm)
-        on = sdb > max(np.percentile(sdb, 95) - 22, -55)
-        t = librosa.frames_to_time(np.arange(len(on)), sr=ASR, hop_length=HOP)
-        state, last = False, -99
-        for i in range(0, len(on), w // 2 or 1):
-            seg = on[i:i + w * 2]
-            now = seg.mean() > 0.6
-            if now != state and t[i] - last >= min_gap:
-                events.append((float(t[i]), name, "in" if now else "out"))
-                state, last = now, t[i]
-    events.sort()
-    return events
 
 
 def peaks_and_drops(t, energy, duration):
@@ -595,7 +520,7 @@ def section_role(i, n, e_mean, all_means, rising):
     hi, lo = np.percentile(all_means, 70), np.percentile(all_means, 35)
     if i == 0 and e_mean < hi:
         return "Intro"
-    if i == n - 1 and e_mean < hi:
+    if i == n - 1 and e_mean < np.median(all_means):
         return "Outro"
     if e_mean >= hi:
         return "Peak (chorus / drop)"
@@ -606,224 +531,346 @@ def section_role(i, n, e_mean, all_means, rising):
     return "Verse / groove"
 
 
+def load_or_separate(y, out, save, fresh):
+    sd = os.path.join(out, "stems")
+    paths = {n: os.path.join(sd, f"{n}.wav") for n in STEM_ORDER}
+    if not fresh and all(os.path.exists(p) for p in paths.values()):
+        stems = {n: sf.read(p, dtype="float32", always_2d=True)[0].T for n, p in paths.items()}
+        if all(abs(s.shape[1] - y.shape[1]) < SR // 10 for s in stems.values()):
+            print("      (reusing stems already saved for this song; pass --fresh to redo)")
+            return stems
+    return separate(y, out, save=save)
+
+
+BLEED_HINTS = {"piano": {"guitar", "strings"},
+               "guitar": {"piano", "synth pluck", "pizzicato strings", "harp"}}
+NOT_AN_INSTRUMENT = {"sound effects and noise, not drums", "sound effects and field recordings",
+                     "vinyl crackle and noise"}
+GENERIC = {"drums": "drums", "bass": "bass", "guitar": "guitar", "piano": "piano"}
+CONF_WORD = {"clear": "confident", "likely": "fairly confident", "unsure": "not sure"}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("song")
     ap.add_argument("-o", "--out", default=None)
     ap.add_argument("--no-stems", action="store_true", help="skip saving stem WAVs")
+    ap.add_argument("--fresh", action="store_true", help="redo stem separation even if stems exist")
     args = ap.parse_args()
     base = os.path.splitext(os.path.basename(args.song))[0]
     out = args.out or os.path.join("breakdowns", base)
     os.makedirs(out, exist_ok=True)
+    step = lambda i, msg: (print(f"[{i}/7] {msg}"), sys.stdout.flush())
 
-    print("[1/6] loading audio"); sys.stdout.flush()
+    step(1, "loading audio")
     y = load_audio(args.song)
     duration = y.shape[1] / SR
     mix_m = to_mono(y)
     mix_rms = np.sqrt(np.mean(mix_m ** 2) + 1e-12)
 
-    print("[2/6] splitting into stems (Demucs 6-stem, takes a few minutes on CPU)"); sys.stdout.flush()
-    stems = separate(y, out, save=not args.no_stems)
+    step(2, "splitting into stems (Demucs 6-stem, about a minute on CPU)")
+    stems = load_or_separate(y, out, not args.no_stems, args.fresh)
     stems_m = {k: to_mono(v) for k, v in stems.items()}
 
-    print("[3/6] tempo, key, beats, drum patterns"); sys.stdout.flush()
+    step(3, "tempo, beats, bar lines, drum pattern")
     tempo, beat_t, feel = detect_tempo(stems_m["drums"], mix_m)
-    harm = sum(v for k, v in stems_m.items() if k not in ("drums",))
-    pats, _, _ = drum_patterns(stems_m["drums"], beat_t)
+    pats, envs, env_t = drum_patterns(stems_m["drums"], beat_t)
+    phase = find_downbeat_phase(beat_t, envs["Kick"], env_t)
+    bars, bar_len, has_beat = S.bar_grid(beat_t, phase, duration)
 
-    print("[4/6] energy curve, sections, peaks"); sys.stdout.flush()
+    step(4, "energy curve, peaks and drops")
     t, energy = energy_curve(mix_m)
     peaks, drops, dips = peaks_and_drops(t, energy, duration)
 
-    print("[5/6] describing each instrument"); sys.stdout.flush()
+    step(5, "measuring each instrument, key, tuning, chords, sections")
     stem_info, stem_rms = {}, {}
     for name in STEM_ORDER:
         info, rms, _ = describe_stem(name, stems[name], mix_rms)
-        stem_info[name] = info
-        stem_rms[name] = rms
+        stem_info[name], stem_rms[name] = info, rms
+    present = [n for n in STEM_ORDER if stem_info[n]["present"]]
+    harm_all = sum(v for k, v in stems_m.items() if k != "drums")
     bass_note = (stem_info["bass"].get("most_used_notes") or [None])[0]
-    key, key_r, key_alt, key_conf = detect_key(harm, bass_note)
-    events = [e for e in entrances({k: v for k, v in stem_rms.items() if stem_info[k]["present"]}, duration)
-              if e[0] > 1.0]
+    key_raw, _, key_alt, key_conf = detect_key(harm_all, bass_note)
+    key = S.pretty_key(key_raw)
+    tuning = measure_tuning(stems_m, stem_info)
+    gtune = guitar_tuning(stems_m["guitar"], key_raw) if stem_info["guitar"]["present"] else None
 
-    big = [e for e in events if e[1] in ("drums", "bass", "vocals")]
-    forced = sorted(set([round(e[0], 1) for e in big] + [d for d, _ in drops] + [d for d, _ in dips]))
-    sections = segment(mix_m, stems_m, beat_t, duration, tempo, forced)
+    edges = np.concatenate([bars, [duration]])
+    half = bar_len > 2.6                      # slow songs: two chords per bar can matter
+    c_edges = np.sort(np.concatenate([edges, (edges[:-1] + edges[1:]) / 2])) if half else edges
+    chords = S.chord_track(stems_m, c_edges, key_raw)
+    cu = 2 if half else 1
+    Ch = librosa.feature.chroma_cqt(y=harm_all, sr=ASR, hop_length=HOP * 2)
+    cft = librosa.frames_to_time(np.arange(Ch.shape[1]), sr=ASR, hop_length=HOP * 2)
+    chroma_bar = S.per_unit(Ch, cft, edges)
+    chroma_bar = chroma_bar / (chroma_bar.max(axis=0, keepdims=True) + 1e-9)
+    sections = S.find_sections(stem_rms, present, energy, t, chroma_bar, bars, bar_len, duration)
+    mix = S.mix_report(y, SR)
 
-    print("[6/6] recognising instruments, genre and mood (AST)"); sys.stdout.flush()
+    step(6, "listening: which instruments, genre, mood (CLAP) + voice and sound effects (AST)")
     tagger = Tagger()
     r16 = lambda x: librosa.resample(x, orig_sr=ASR, target_sr=16000)
-    _, probs_mix = tagger.windows(r16(mix_m))
-    instrumental = sum(v for k, v in stems_m.items() if k != "vocals")
-    win_t, probs = tagger.windows(r16(instrumental))  # voice removed, so instruments aren't drowned out
-    instruments = tagger.top(probs, k=14, kind="instrument", min_p=0.02)
-    genres = tagger.top(probs, k=5, kind="genre", min_p=0.015)
-    moods = tagger.top(probs, k=3, kind="mood", min_p=0.01)
-    sfx = []
+    win_t, probs_mix = tagger.windows(r16(mix_m))
     seen = {}
     for wi, wt in enumerate(win_t):
         for i in np.argsort(probs_mix[wi])[::-1][:12]:
             if tagger.kind_of(i) == "sfx" and probs_mix[wi, i] > 0.04 and tagger.labels[int(i)] not in GENERIC_TAGS:
                 seen.setdefault(tagger.labels[int(i)], []).append(float(wt))
-    for lab, tl in sorted(seen.items(), key=lambda x: x[1][0]):
-        sfx.append((lab, tl))
-    voice_type = None
-    if stem_info["vocals"]["present"]:
+    sfx = sorted(seen.items(), key=lambda x: x[1][0])
+    voice_type, singing = None, False
+    if "vocals" in present:
         _, p_v = tagger.windows(r16(stems_m["vocals"]))
         lab = {v: k for k, v in tagger.labels.items()}
         sp = float(np.percentile(p_v[:, [lab[x] for x in tagger.SPEECH if x in lab]].max(1), 75))
         sg = float(np.percentile(p_v[:, [lab[x] for x in tagger.SINGING if x in lab]].max(1), 75))
         voice_type = ("spoken voice (narration / voiceover)" if sp > sg * 1.5 else
                       "singing" if sg > sp * 1.5 else "mix of singing and speech")
-    tuning = measure_tuning(stems_m, stem_info)
-    gtune = guitar_tuning(stems_m["guitar"], key) if stem_info["guitar"]["present"] else None
-    other_tags = []
-    if stem_info["other"]["present"]:
-        _, p_o = tagger.windows(r16(stems_m["other"]))
-        other_tags = tagger.top(p_o, k=6, kind="instrument", min_p=0.05)
-    stem_check = {}
-    for n in ("guitar", "piano", "bass", "drums"):
-        if stem_info[n]["present"]:
-            _, p_s = tagger.windows(r16(stems_m[n]))
-            stem_check[n] = tagger.top(p_s, k=4, kind="instrument", min_p=0.05)
+        singing = not voice_type.startswith("spoken")
 
-    merged_inst = dict(instruments)
-    for tags in [other_tags] + list(stem_check.values()):
-        for n, pr in tags:
-            if tagger.kind_of({v: k for k, v in tagger.labels.items()}[n]) == "instrument":
-                merged_inst[n] = max(merged_inst.get(n, 0), pr)
-    instruments = sorted(merged_inst.items(), key=lambda x: -x[1])[:14]
+    spoken = voice_type is not None and not singing
+    ear = S.Listener()
+    # a narrator would be mistaken for part of the music, so judge genre without the voice stem
+    genre_src = sum(v for k, v in stems_m.items() if k != "vocals") if spoken else mix_m
+    _, pm = ear.listen(genre_src, ASR, ["genre", "mood", "production"])
+    genres = S.rank(pm["genre"], S.VOCAB["genre"], 4)
+    moods = S.rank(pm["mood"], S.VOCAB["mood"], 3)
+    production = S.rank(pm["production"], S.VOCAB["production"], 2)
 
-    # per-section summary
+    skip = {"vocal chops and vocal samples"} if spoken else set()   # that would be narrator bleed
+    ident, layers = {}, []
+    for n in present:
+        if n == "vocals" and not singing:
+            continue
+        wt, pr = ear.listen(stems_m[n], ASR, [n])
+        if wt is None:
+            continue
+        ident[n] = S.identify(pr[n], n, skip)
+        if n == "other":
+            layers = S.layers_over_time(wt, pr[n], S.VOCAB[n], skip=skip)
+    vocal_style = ident["vocals"]["detail"] if singing and "vocals" in ident else None
+
+    # short instrument phrase per stem, for prompts
+    phrases = {}
+    for n in sorted(present, key=lambda k: -stem_info[k]["level_vs_mix_db"]):
+        idn = ident.get(n)
+        if n == "vocals" or not idn:
+            continue
+        if n == "other":
+            good = [l["label"] for l in layers if l["label"] not in NOT_AN_INSTRUMENT][:2]
+            if not good and idn["detail"] not in NOT_AN_INSTRUMENT:
+                good = [idn["detail"]]
+            if good:
+                phrases[n] = good
+            continue
+        if idn["detail"] in BLEED_HINTS.get(n, ()) or idn["family"] in NOT_AN_INSTRUMENT:
+            continue                            # stem is really something else bleeding in
+        if idn["confidence"] == "unsure":
+            phrases[n] = [GENERIC[n]]
+        elif idn["detail_p"] >= 0.5 * idn["family_p"]:
+            phrases[n] = [idn["detail"]]        # specific sound is clear
+        else:
+            phrases[n] = [idn["family"]]
+
+    step(7, "writing report")
+    # ---- sections
     sec_rows = []
-    means = [energy[(t >= s) & (t < e)].mean() for s, e, _ in sections]
-    for i, (s, e, lab) in enumerate(sections):
-        sel = (t >= s) & (t < e)
-        seg_e = energy[sel]
-        half = len(seg_e) // 2
-        rising = half > 0 and seg_e[half:].mean() - seg_e[:half].mean() > 0.12
+    means = [float(energy[(t >= s) & (t < e)].mean()) for s, e, *_ in sections]
+    for i, (s, e, letter, a, b) in enumerate(sections):
+        seg_e = energy[(t >= s) & (t < e)]
+        h = len(seg_e) // 2
+        rising = h > 0 and seg_e[h:].mean() - seg_e[:h].mean() > 0.12
         playing = []
-        for n in STEM_ORDER:
-            if not stem_info[n]["present"]:
-                continue
+        for n in present:
             r = stem_rms[n]
             ft = librosa.frames_to_time(np.arange(len(r)), sr=ASR, hop_length=HOP)
             rs = r[(ft >= s) & (ft < e)]
             if len(rs) and db(np.percentile(rs, 75)) > db(np.percentile(r, 95)) - 20:
                 playing.append(n)
-        wsel = (win_t + 5 >= s) & (win_t + 5 < e)
-        tags = tagger.top(probs[wsel], k=3, kind="instrument", min_p=0.05) if wsel.any() else []
-        sec_rows.append({"start": s, "end": e, "part": lab,
+        prog, loop = S.progression(chords[a * cu:b * cu])
+        sec_rows.append({"start": s, "end": e, "part": letter, "bars": b - a,
                          "role": section_role(i, len(sections), means[i], means, rising),
-                         "energy": round(float(means[i]), 2), "playing": playing,
-                         "heard": [x[0] for x in tags]})
+                         "energy": round(means[i], 2), "playing": playing,
+                         "chords": prog, "chords_loop": loop})
+    loops = [r["chords"] for r in sec_rows if r["chords"] and r["chords_loop"]]
+    main_prog = max(set(loops), key=loops.count) if loops else None
+    loop_bars = sum(r["bars"] for r in sec_rows if r["chords_loop"] and r["chords"] == main_prog)
+    loop_share = loop_bars / max(1, sum(r["bars"] for r in sec_rows))
+    vals = [c for c in chords if c]
+    common_chords = sorted(set(vals), key=lambda c: -vals.count(c))[:4]
+    if main_prog and loop_share >= 0.5:      # only trust the loop for the key if it runs most of the song
+        rel = S.pretty_key(relative_key(key_raw))
+        rn, rmode = rel.split()
+        if main_prog.split(" → ")[0] == rn + ("m" if rmode == "minor" else ""):
+            key_raw = relative_key(key_raw)
+            key = rel
 
-    # ---------- write report
-    present = [n for n in STEM_ORDER if stem_info[n]["present"]]
+    # ---- key moments
+    moments = []
+    for d_, _ in sorted(drops, key=lambda x: -x[1])[:5]:
+        moments.append((d_, "big hit / drop"))
+    for d_, _ in sorted(dips, key=lambda x: -x[1])[:3]:
+        moments.append((d_, "pull-back"))
+    for p_, _ in sorted(peaks, key=lambda x: -x[1])[:2]:
+        moments.append((p_, "peak"))
+    moments.sort()
+    kept = []
+    order = {"big hit / drop": 0, "pull-back": 1, "peak": 2}
+    for m in moments:
+        if kept and m[0] - kept[-1][0] < 3:
+            if order[m[1]] < order[kept[-1][1]]:
+                kept[-1] = m
+            continue
+        kept.append(m)
+    moment_rows = []
+    for tm, kind in kept:
+        ins, outs = S.what_changed(tm, stem_rms, [n for n in present if not (spoken and n == "vocals")])
+        moment_rows.append({"time": tm, "kind": kind, "enter": ins, "leave": outs})
+    entries = S.first_entries(stem_rms, present)
+
     title = f"{base} · {tempo:.0f} BPM · {key} · {ts(duration)}"
-    plot(os.path.join(out, "timeline.png"), t, energy, sections, peaks, drops, stem_rms, duration, title)
+    plot(os.path.join(out, "timeline.png"), t, energy, [(s, e, l) for s, e, l, *_ in sections],
+         peaks, drops, stem_rms, duration, title)
 
+    prompt_data = {"genres": genres, "moods": moods, "tempo": tempo, "key": key,
+                   "instrument_phrases": phrases, "sections": sec_rows, "singing": singing,
+                   "vocal_style": vocal_style, "production": production[0][0] if production else None}
+    prompts = S.suno_prompts(prompt_data)
+
+    # ================================================= markdown
+    flat = key_raw in S.FLAT_KEYS
+    spell = lambda notes: ", ".join(S.NOTE_FLAT[S.NOTE_SHARP.index(x)] if flat and x in S.NOTE_SHARP else x for x in notes)
+    pct = lambda items, k=3: ", ".join(f"{n} ({p:.0%})" for n, p in items[:k])
     L = [f"# Sound breakdown: {base}", ""]
-    L += ["## Overview", "",
-          f"- **Length:** {ts(duration)}",
-          f"- **Tempo:** {tempo:.0f} BPM" + (f" ({feel})" if feel else ""),
-          f"- **Key:** {key} (same notes as {relative_key(key)})" + (f"; could also be {key_alt}" if key_conf < 0.03 and key_alt != relative_key(key) else ""),
-          f"- **Genre (model guess):** " + (", ".join(f"{g} ({p:.0%})" for g, p in genres) or "unclear"),
-          f"- **Mood (model guess):** " + (", ".join(f"{m}" for m, _ in moods) or "unclear"),
-          f"- **Instruments heard (model, voice removed):** " + (", ".join(f"{n} ({p:.0%})" for n, p in instruments) or "unclear"),
-          f"- **Voice:** " + (voice_type or "no voice"),
-          f"- **Sound design / non-music sounds:** " + ("; ".join(f"{n} ({', '.join(ts(x) for x in tl[:3])})" for n, tl in sfx[:25]) or "none detected"),
-          ""]
-    L += ["## Tuning", ""]
-    if tuning:
-        L.append(f"- **Reference pitch:** A4 ≈ {tuning['a4_hz']} Hz ({tuning['cents_from_440']:+.0f} cents from 440), so **{tuning['verdict']}**. Agreement between instruments: {tuning['agreement']} "
-                 f"({', '.join(f'{k} {v:+.0f}¢' for k, v in tuning['per_stem_cents'].items())})")
-    else:
-        L.append("- Reference pitch: not enough pitched sound to measure")
-    if gtune:
-        L.append(f"- **Guitar tuning (guess):** {gtune['guess']} (confidence: {gtune['confidence']}; lowest note played ≈ {gtune['lowest_note']}, {gtune['share_below_E2_pct']}% of notes below standard low E)")
-    L.append("")
-    L += ["## Song map (where the heights are)", "", "![timeline](timeline.png)", "",
-          "| Time | Part | What it is | Energy | Playing |", "|---|---|---|---|---|"]
+    inst_line = S.join_words([x for v in phrases.values() for x in v]) or "unclear"
+    L += [f"**In one line:** {genres[0][0]} at {tempo:.0f} BPM in {key}, {moods[0][0]}, "
+          f"built from {inst_line}"
+          + (f", with {vocal_style}" if vocal_style else ", with a spoken voiceover" if voice_type else ", no voice")
+          + ".", ""]
+
+    L += ["## Overview", "", "| | | How sure |", "|---|---|---|",
+          f"| Length | {ts(duration)} | measured |",
+          f"| Tempo | {tempo:.0f} BPM" + (f" ({feel})" if feel else "") + f" | {'measured' if has_beat else 'no steady beat found'} |",
+          f"| Key | {key} (same notes as {S.pretty_key(relative_key(key_raw))}) | measured, medium |",
+          f"| Tuning | " + (f"A4 ≈ {tuning['a4_hz']} Hz ({tuning['cents_from_440']:+.0f} cents): {tuning['verdict']} | measured, {tuning['agreement']} agreement |"
+                           if tuning else "not enough pitched sound | — |"),
+          f"| Genre | {pct(genres)} | model guess |",
+          f"| Mood | {pct(moods)} | model guess |",
+          f"| Production | {pct(production, 2)} | model guess |",
+          f"| Voice | {(vocal_style + ' (' + voice_type + ')') if vocal_style else (voice_type or 'none')} | model guess |",
+          (f"| Main chord loop | {main_prog} (in {loop_share:.0%} of the song) | measured, {'good' if loop_share >= 0.5 else 'low'} |"
+           if main_prog else "| Main chord loop | no steady loop found | — |"),
+          f"| Most common chords | {', '.join(common_chords) or '—'} | measured, medium |", ""]
+
+    L += ["## Instruments", "",
+          "Loudest first. Each one was separated from the mix, then identified by a music model and measured.", ""]
+    for n in sorted(present, key=lambda k: -stem_info[k]["level_vs_mix_db"]):
+        i = stem_info[n]
+        idn = ident.get(n)
+        if n == "vocals":
+            head = vocal_style or voice_type
+        elif idn:
+            head = idn["call"] + (f" ({idn['detail']})" if idn["confidence"] != "unsure" and idn["detail"] != idn["family"] else "")
+        else:
+            head = "unidentified"
+        L.append(f"### {n.capitalize()}: {head}")
+        if idn:
+            L.append(f"- **Identified as:** {pct(idn['families'])} ({CONF_WORD[idn['confidence']]}). "
+                     f"Closest specific sounds: {pct(idn['closest'])}")
+            top = idn["detail"]
+            if top in BLEED_HINTS.get(n, ()):
+                L.append(f"- ⚠️ The separator put this in the '{n}' stem, but it sounds like **{top}**. "
+                         f"Probably not a real {n}; treat it as bleed from another instrument.")
+            if top in NOT_AN_INSTRUMENT:
+                L.append("- ⚠️ This stem is mostly non-musical sound (effects, noise), not a played instrument.")
+        if n == "other" and layers:
+            L.append("- **Layers found over time:** " + "; ".join(
+                f"{l['label']} ({', '.join(ts(a) + '–' + ts(min(b, duration)) for a, b in l['ranges'][:4])})"
+                for l in layers[:5]))
+        L.append(f"- **Sound:** {', '.join(i['sound'])}")
+        L.append(f"- **In the mix:** {i['level_vs_mix_db']:+.1f} dB vs the full song, playing {i['active_pct']}% of the time"
+                 + (f", first comes in at {ts(entries[n])}" if n in entries else ""))
+        sp = i["spectrum_share"]
+        L.append(f"- **Frequency:** sub {sp['sub<60']:.0%} · low {sp['low60-250']:.0%} · mid {sp['mid250-4k']:.0%} · high {sp['high>4k']:.0%} (brightness ≈ {i['brightness_hz']} Hz)")
+        if n == "vocals" and spoken:
+            pass
+        elif "pitch_range" in i:
+            L.append(f"- **Notes:** range {i['pitch_range']}, most used {spell(i['most_used_notes'])}")
+        elif "most_used_notes" in i:
+            L.append(f"- **Notes:** most used {spell(i['most_used_notes'])}")
+        if n == "guitar" and gtune:
+            L.append(f"- **Guitar tuning (guess):** {gtune['guess']} (confidence {gtune['confidence']}; lowest note ≈ {gtune['lowest_note']})")
+        L.append("")
+    absent = [n for n in STEM_ORDER if n not in present]
+    if absent:
+        L += [f"Not in this song (only faint bleed): {', '.join(absent)}.", ""]
+
+    L += ["## Song map", "", "![timeline](timeline.png)", "",
+          "| Time | Bars | Part | What it is | Energy | Playing | Chords |", "|---|---|---|---|---|---|---|"]
     for r in sec_rows:
         bar = "█" * int(round(r["energy"] * 10)) + "░" * (10 - int(round(r["energy"] * 10)))
-        L.append(f"| {ts(r['start'])}–{ts(r['end'])} | {r['part']} | {r['role']} | {bar} | "
-                 f"{', '.join(r['playing']) or '—'} |")
-    L += ["", "Parts with the same letter sound alike (e.g. two choruses).", ""]
-    if peaks:
-        L.append("**Highest points:** " + ", ".join(f"{ts(p)}" for p, _ in sorted(peaks, key=lambda x: -x[1])))
-    if drops:
-        L.append("\n**Drops / big hits (energy jumps up):** " + ", ".join(ts(d) for d, _ in drops))
-    if dips:
-        L.append("\n**Pull-backs (energy falls away):** " + ", ".join(ts(d) for d, _ in dips))
-    if events:
-        L += ["", "**Arrangement moves:**", ""]
-        for tt_, n, w in events[:40]:
-            L.append(f"- {ts(tt_)} — {n} {'comes in' if w == 'in' else 'drops out'}")
+        L.append(f"| {ts(r['start'])}–{ts(r['end'])} | {r['bars'] if has_beat else '—'} | {r['part']} | {r['role']} | {bar} | "
+                 f"{', '.join(r['playing']) or '—'} | {(r['chords'] or '—') + (' (loop)' if r['chords_loop'] else '')} |")
+    L += ["", "Parts with the same letter sound alike. Chords are per bar; treat them as a guide.", ""]
+
+    L += ["## Key moments", ""]
+    for m in moment_rows:
+        ch = []
+        if m["enter"]:
+            ch.append(f"{S.join_words(m['enter'])} come{'s' if len(m['enter']) == 1 else ''} in")
+        if m["leave"]:
+            ch.append(f"{S.join_words(m['leave'])} drop{'s' if len(m['leave']) == 1 else ''} out")
+        L.append(f"- **{ts(m['time'])}** {m['kind']}" + (f": {'; '.join(ch)}" if ch else ""))
+    if not moment_rows:
+        L.append("- The energy stays even; no big hits or drops found.")
     L.append("")
 
     L += ["## The beat", ""]
-    if pats:
-        L += [f"One bar of 4/4 in 16th notes (X = strong hit, x = softer hit, . = nothing), averaged over the song:", "",
+    drum_id = ident.get("drums", {}).get("family")
+    if pats and "drums" in present and drum_id not in NOT_AN_INSTRUMENT:
+        L += ["One bar of 4/4 in 16th notes (X = strong hit, x = softer hit, . = nothing), averaged over the song:", "",
               "```", "                 1... 2... 3... 4..."]
         for n, p in pats.items():
-            L.append(f"{n:<17}{p['pattern']}   ~{p['hits_per_bar']} hits/bar, in {p['bars_playing_pct']}% of bars")
+            L.append(f"{n:<17}{p['pattern']}   ~{p['hits_per_bar']:.0f} hits/bar, in {p['bars_playing_pct']}% of bars")
         L += ["```", ""]
+        if ident.get("drums", {}).get("confidence") == "unsure":
+            L += ["The drum sound wasn't clearly identified, so this pattern may include non-drum hits.", ""]
     else:
-        L += ["No steady drum pattern found (the song may have no drums or a free tempo).", ""]
+        L += ["No reliable drum pattern (no drums, a free tempo, or the drum stem is mostly effects).", ""]
 
-    L += ["## Each instrument, what it sounds like", ""]
-    for n in STEM_ORDER:
-        i = stem_info[n]
-        if not i["present"]:
-            L.append(f"### {n.capitalize()}: not really in this song (only faint bleed)\n")
-            continue
-        L.append(f"### {n.capitalize()}")
-        L.append(f"- **Sound:** {', '.join(i['sound'])}")
-        L.append(f"- **Loudness in the mix:** {i['level_vs_mix_db']:+.1f} dB vs full song · playing {i['active_pct']}% of the time")
-        sp = i["spectrum_share"]
-        L.append(f"- **Where its energy sits:** sub {sp['sub<60']:.0%} · low {sp['low60-250']:.0%} · mid {sp['mid250-4k']:.0%} · high {sp['high>4k']:.0%} (brightness ≈ {i['brightness_hz']} Hz)")
-        if "pitch_range" in i:
-            L.append(f"- **Pitch range:** {i['pitch_range']} · most used notes: {', '.join(i['most_used_notes'])}")
-        elif "most_used_notes" in i:
-            L.append(f"- **Most used notes (chords/harmony):** {', '.join(i['most_used_notes'])}")
-        if n == "other" and other_tags:
-            L.append(f"- **What the 'other' stem holds (model):** " + ", ".join(f"{a} ({p:.0%})" for a, p in other_tags))
-        if n in stem_check:
-            L.append(f"- **Model check on this stem:** " + (", ".join(f"{a} ({p:.0%})" for a, p in stem_check[n]) or "no clear instrument; may be bleed from other parts"))
-        L.append("")
+    L += ["## Mix and production", "",
+          f"- **Overall:** {', '.join(mix['words'])}",
+          f"- **Loudness:** loud parts at {mix['loud_parts_dbfs']} dBFS, peaks at {mix['peak_dbfs']} dBFS; "
+          f"{mix['section_contrast_db']} dB between loud and quiet parts",
+          "- **Tonal balance:** " + " · ".join(f"{k} {v:.0%}" for k, v in mix["balance"].items()),
+          f"- **Stereo width:** {mix['stereo_width']} (0 = mono, 1 = extremely wide)", ""]
 
-    # prompt-ready description
-    desc_parts = [f"{', '.join(g for g, _ in genres[:2]) or 'Instrumental'} track at {tempo:.0f} BPM in {key}"
-                  + (f", {tuning['verdict']}" if tuning else "")]
-    if instruments:
-        desc_parts.append("instruments: " + ", ".join(n for n, _ in instruments[:6]))
-    if voice_type:
-        desc_parts.append(f"voice: {voice_type}")
-    if moods:
-        desc_parts.append(f"mood: {moods[0][0].replace(' music', '').lower()}")
-    for n in present:
-        desc_parts.append(f"{n}: {', '.join(stem_info[n]['sound'][:3])}")
-    if pats and "Kick" in pats:
-        desc_parts.append(f"kick pattern {pats['Kick']['pattern']}")
-    roles = " → ".join(dict.fromkeys(r["role"].split(" (")[0] for r in sec_rows))
-    desc_parts.append(f"structure: {roles}")
-    if peaks:
-        desc_parts.append(f"biggest moment around {ts(max(peaks, key=lambda x: x[1])[0])}")
-    L += ["## Quick description (paste into any AI)", "", "> " + "; ".join(desc_parts) + ".", ""]
-    L += ["---", "Measured with Demucs htdemucs_6s, MIT AST (AudioSet) and librosa. Numbers are measured; "
-          "genre/mood/instrument names and guitar tuning are model guesses. Stems are in `stems/`."]
+    if sfx:
+        L += ["## Sound design (non-music sounds)", "",
+              "; ".join(f"{n} ({', '.join(ts(x) for x in tl[:3])})" for n, tl in sfx[:20]), ""]
+
+    L += ["## Prompts to recreate this", "",
+          "**Suno, Simple mode** (paste into the one box):", "", "```", prompts["simple"], "```", "",
+          "**Suno, Advanced mode, Styles box:**", "", "```", prompts["styles"], "```", ""]
+    if prompts["instrumental"]:
+        L += ["**Lyrics box:** leave empty (this track has no singing).", ""]
+    else:
+        L += ["**Lyrics box:** your own lyrics, using this section order:", "", "```", prompts["lyrics_tags"], "```", ""]
+    L += ["---", "Stems: Demucs htdemucs_6s. Instrument, genre and mood names: LAION CLAP. Voice and sound effects: MIT AST. "
+          "Tempo, key, tuning, chords, energy and timbre: measured with librosa. Stems are in `stems/`."]
 
     with open(os.path.join(out, "report.md"), "w") as f:
         f.write("\n".join(L))
     data = {"file": args.song, "duration_sec": duration, "tempo_bpm": tempo, "key": key,
-            "key_alternative": key_alt, "genres": genres, "moods": moods, "instruments": instruments,
-            "sections": sec_rows, "peaks": peaks, "drops": drops, "pullbacks": dips,
-            "arrangement_events": events, "drum_patterns": pats, "stems": stem_info,
-            "other_stem_tags": other_tags, "stem_checks": stem_check,
-            "tuning": tuning, "guitar_tuning": gtune, "voice": voice_type, "sound_design": sfx}
+            "key_alternative": key_alt, "tuning": tuning, "guitar_tuning": gtune,
+            "genres": genres, "moods": moods, "production": production,
+            "voice": voice_type, "vocal_style": vocal_style,
+            "instruments": ident, "other_layers": layers, "stems": stem_info,
+            "sections": sec_rows, "main_chord_loop": main_prog, "loop_share": loop_share, "common_chords": common_chords, "chords_per_unit": chords,
+            "chord_unit": "half bar" if half else "bar", "bar_starts": [float(x) for x in bars],
+            "moments": moment_rows, "first_entries": entries, "drum_patterns": pats,
+            "mix": mix, "sound_design": sfx, "prompts": prompts}
     with open(os.path.join(out, "report.json"), "w") as f:
-        json.dump(data, f, indent=2, default=float)
+        json.dump(data, f, indent=2, default=float, ensure_ascii=False)
     print(f"\nDone → {out}/report.md")
 
 

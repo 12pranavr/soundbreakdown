@@ -2,7 +2,12 @@
 
 Upload any song and get a plain-language breakdown of how it's built: the instruments, what each one sounds like, the beat, the tuning, and where the big moments are. It's made for describing music you love to a person or an AI.
 
-Free and open-source only: [Demucs](https://github.com/facebookresearch/demucs) (stem separation), [MIT AST](https://huggingface.co/MIT/ast-finetuned-audioset-10-10-0.4593) (instrument / genre / mood / sound recognition), [librosa](https://librosa.org) (tempo, key, tuning, beats, energy, timbre).
+Free and open-source only:
+
+- [Demucs](https://github.com/facebookresearch/demucs) splits the song into drums, bass, vocals, guitar, piano and other.
+- [LAION CLAP](https://huggingface.co/laion/larger_clap_music_and_speech) listens to each separated stem and names the instrument (for example "808 sub bass", "palm muted electric guitar", "tabla"), plus genre, mood and production style.
+- [MIT AST](https://huggingface.co/MIT/ast-finetuned-audioset-10-10-0.4593) tells singing from narration and finds sound effects.
+- [librosa](https://librosa.org) measures tempo, key, tuning, chords, beats, energy and timbre.
 
 ## Setup (once)
 
@@ -31,20 +36,25 @@ Use `--no-stems` to skip saving the WAVs.
 
 ## What the report covers
 
-- **Overview:** tempo, key (plus its relative major/minor), genre, mood, instruments (tagged with the voice removed), voice type (singing or narration), sound effects with timestamps
-- **Tuning:** reference pitch (A = 440, 432, …), measured in cents from the instruments, plus a guess at the guitar tuning (standard, drop D, …)
-- **Song map:** sections (intro, build, peak, breakdown, outro), highest points, drops, pull-backs, and when each instrument comes in or drops out
+- **In one line:** genre, tempo, key, mood and the instruments
+- **Overview:** tempo, key, tuning (A = 440, 432, …), genre, mood, production style, voice, main chord loop, each with how sure it is
+- **Instruments:** loudest first. Each gets an instrument family with a confidence level, the closest specific sounds, a description (bright or dark, clean or gritty, plucky or sustained, wide or narrow), when it first comes in, and the notes it uses. It warns when a stem is really another instrument bleeding in.
+- **Song map:** sections on bar lines with their role, energy, what's playing and the chords
+- **Key moments:** the biggest hits, drops and pull-backs, and which instruments come in or drop out there
 - **The beat:** kick, snare and hi-hat patterns on a 16-step grid
-- **Each instrument:** brightness, grit, plucky or sustained, busy or sparse, stereo width, pan, dynamics, pitch range, notes used
-- **Quick description:** one paragraph you can paste into any AI
+- **Mix and production:** loudness, loud/soft contrast, tonal balance, stereo width
+- **Sound design:** non-music sounds with timestamps
+- **Prompts:** ready-to-paste Suno prompts (Simple mode sentence and Advanced mode Styles)
 
 ## How reliable each part is
 
 | Measured (reliable) | Model guesses (treat as hints) |
 |---|---|
-| Tempo, beat pattern, energy curve, drops, when instruments enter, tuning in cents, bass notes, timbre numbers | Genre, mood, instrument names, guitar tuning, section names |
+| Tempo, beat pattern, energy curve, drops, when instruments enter, tuning in cents, bass notes, timbre numbers, chord loops that repeat | Genre, mood, instrument names, guitar tuning, section names, chords in sections with no steady loop |
 
-Known limits: the piano and guitar stems bleed into each other, sound effects can end up in the drums stem, and non-Western instruments are recognised poorly.
+Known limits: piano and guitar stems bleed into each other, sound effects and narration confuse the drum and genre calls, quiet changes inside a section (a soft melody joining) are not split out, and it has been checked against one synthetic song with known answers and one real soundtrack.
+
+Stems are reused if they already exist for a song; pass `--fresh` to redo the separation.
 
 ## Test
 
