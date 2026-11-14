@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+songs/
+breakdowns/
+test/out/
+*.wav
+*.mp3
+*.m4a
+*.flac
